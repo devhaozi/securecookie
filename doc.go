@@ -6,22 +6,15 @@
 Package securecookie encodes and decodes authenticated and optionally
 encrypted cookie values.
 
-Secure cookies can't be forged, because their values are validated using HMAC.
-When encrypted, the content is also inaccessible to malicious eyes.
+Secure cookies can't be forged, because their values are encrypted and validated
+using ChaCha20-Poly1305, the content is inaccessible to malicious eyes.
 
 To use it, first create a new SecureCookie instance:
 
-	var hashKey = []byte("very-secret")
-	var blockKey = []byte("a-lot-secret")
-	var s = securecookie.New(hashKey, blockKey)
+	var key = []byte("32-byte-long-auth-key")
+	var s, err = securecookie.New(key)
 
-The hashKey is required, used to authenticate the cookie value using HMAC.
-It is recommended to use a key with 32 or 64 bytes.
-
-The blockKey is optional, used to encrypt the cookie value -- set it to nil
-to not use encryption. If set, the length must correspond to the block size
-of the encryption algorithm. For AES, used by default, valid lengths are
-16, 24, or 32 bytes to select AES-128, AES-192, or AES-256.
+The key is required and must be 32 bytes, used to authenticate and encrypt cookie values.
 
 Strong keys can be created using the convenience function GenerateRandomKey().
 
@@ -53,9 +46,7 @@ value:
 		}
 	}
 
-We stored a map[string]string, but secure cookies can hold any value that
-can be encoded using encoding/gob. To store custom types, they must be
-registered first using gob.Register(). For basic types this is not needed;
+Secure cookies can hold any value thatcan be encoded using encoding/json.
 it works out of the box.
 */
 package securecookie

@@ -6,116 +6,27 @@ package securecookie
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
-	"encoding/gob"
-	"encoding/json"
 	"fmt"
-	"hash"
-	"io"
 	"strconv"
-	"strings"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
-
-// Error is the interface of all errors returned by functions in this library.
-type Error interface {
-	error
-
-	// IsUsage returns true for errors indicating the client code probably
-	// uses this library incorrectly.  For example, the client may have
-	// failed to provide a valid hash key, or may have failed to configure
-	// the Serializer adequately for encoding value.
-	IsUsage() bool
-
-	// IsDecode returns true for errors indicating that a cookie could not
-	// be decoded and validated.  Since cookies are usually untrusted
-	// user-provided input, errors of this type should be expected.
-	// Usually, the proper action is simply to reject the request.
-	IsDecode() bool
-
-	// IsInternal returns true for unexpected errors occurring in the
-	// securecookie implementation.
-	IsInternal() bool
-
-	// Cause, if it returns a non-nil value, indicates that this error was
-	// propagated from some underlying library.  If this method returns nil,
-	// this error was raised directly by this library.
-	//
-	// Cause is provided principally for debugging/logging purposes; it is
-	// rare that application logic should perform meaningfully different
-	// logic based on Cause.  See, for example, the caveats described on
-	// (MultiError).Cause().
-	Cause() error
-}
-
-// errorType is a bitmask giving the error type(s) of an cookieError value.
-type errorType int
-
-const (
-	usageError = errorType(1 << iota)
-	decodeError
-	internalError
-)
-
-type cookieError struct {
-	typ   errorType
-	msg   string
-	cause error
-}
-
-func (e cookieError) IsUsage() bool    { return (e.typ & usageError) != 0 }
-func (e cookieError) IsDecode() bool   { return (e.typ & decodeError) != 0 }
-func (e cookieError) IsInternal() bool { return (e.typ & internalError) != 0 }
-
-func (e cookieError) Cause() error { return e.cause }
-
-func (e cookieError) Error() string {
-	parts := []string{"securecookie: "}
-	if e.msg == "" {
-		parts = append(parts, "error")
-	} else {
-		parts = append(parts, e.msg)
-	}
-	if c := e.Cause(); c != nil {
-		parts = append(parts, " - caused by: ", c.Error())
-	}
-	return strings.Join(parts, "")
-}
 
 var (
-	errGeneratingIV = cookieError{typ: internalError, msg: "failed to generate random iv"}
-
-	errNoCodecs            = cookieError{typ: usageError, msg: "no codecs provided"}
-	errHashKeyNotSet       = cookieError{typ: usageError, msg: "hash key is not set"}
-	errBlockKeyNotSet      = cookieError{typ: usageError, msg: "block key is not set"}
-	errEncodedValueTooLong = cookieError{typ: usageError, msg: "the value is too long"}
-
-	errValueToDecodeTooLong = cookieError{typ: decodeError, msg: "the value is too long"}
-	errTimestampInvalid     = cookieError{typ: decodeError, msg: "invalid timestamp"}
-	errTimestampTooNew      = cookieError{typ: decodeError, msg: "timestamp is too new"}
-	errTimestampExpired     = cookieError{typ: decodeError, msg: "expired timestamp"}
-	errDecryptionFailed     = cookieError{typ: decodeError, msg: "the value could not be decrypted"}
-	errValueNotByte         = cookieError{typ: decodeError, msg: "value not a []byte."}
-	errValueNotBytePtr      = cookieError{typ: decodeError, msg: "value not a pointer to []byte."}
-
-	// ErrMacInvalid indicates that cookie decoding failed because the HMAC
-	// could not be extracted and verified.  Direct use of this error
-	// variable is deprecated; it is public only for legacy compatibility,
-	// and may be privatized in the future, as it is rarely useful to
-	// distinguish between this error and other Error implementations.
-	ErrMacInvalid = cookieError{typ: decodeError, msg: "the value is not valid"}
+	ErrKeyLength        = fmt.Errorf("the key must be %d bytes", chacha20poly1305.KeySize)
+	ErrDecryptionFailed = fmt.Errorf("the value could not be decrypted")
+	ErrNoCodecs         = fmt.Errorf("no codecs provided")
+	ErrValueNotByte     = fmt.Errorf("the value is not a []byte")
+	ErrValueNotBytePtr  = fmt.Errorf("the value is not a *[]byte")
 )
 
 // Codec defines an interface to encode and decode cookie values.
 type Codec interface {
-	Encode(name string, value interface{}) (string, error)
-	Decode(name, value string, dst interface{}) error
+	Encode(name string, value any) (string, error)
+	Decode(name, value string, dst any) error
 }
 
 // New returns a new SecureCookie.
@@ -132,61 +43,32 @@ type Codec interface {
 // Note that keys created using GenerateRandomKey() are not automatically
 // persisted. New keys will be created when the application is restarted, and
 // previously issued cookies will not be able to be decoded.
-func New(hashKey, blockKey []byte) *SecureCookie {
+func New(key []byte) (*SecureCookie, error) {
+	if len(key) != chacha20poly1305.KeySize {
+		return nil, ErrKeyLength
+	}
 	s := &SecureCookie{
-		hashKey:   hashKey,
-		blockKey:  blockKey,
-		hashFunc:  sha256.New,
+		key:       key,
 		maxAge:    86400 * 30,
 		maxLength: 4096,
-		sz:        GobEncoder{},
+		sz:        JSONEncoder{},
+		timeFunc:  func() int64 { return time.Now().UTC().Unix() },
 	}
-	if len(hashKey) == 0 {
-		s.err = errHashKeyNotSet
-	}
-	if blockKey != nil {
-		s.BlockFunc(aes.NewCipher)
-	}
-	return s
+	return s, nil
 }
 
 // SecureCookie encodes and decodes authenticated and optionally encrypted
 // cookie values.
 type SecureCookie struct {
-	hashKey   []byte
-	hashFunc  func() hash.Hash
-	blockKey  []byte
-	block     cipher.Block
+	key       []byte
 	maxLength int
 	maxAge    int64
 	minAge    int64
-	err       error
 	sz        Serializer
 	// For testing purposes, the function that returns the current timestamp.
 	// If not set, it will use time.Now().UTC().Unix().
 	timeFunc func() int64
 }
-
-// Serializer provides an interface for providing custom serializers for cookie
-// values.
-type Serializer interface {
-	Serialize(src interface{}) ([]byte, error)
-	Deserialize(src []byte, dst interface{}) error
-}
-
-// GobEncoder encodes cookie values using encoding/gob. This is the simplest
-// encoder and can handle complex types via gob.Register.
-type GobEncoder struct{}
-
-// JSONEncoder encodes cookie values using encoding/json. Users who wish to
-// encode complex types need to satisfy the json.Marshaller and
-// json.Unmarshaller interfaces.
-type JSONEncoder struct{}
-
-// NopEncoder does not encode cookie values, and instead simply accepts a []byte
-// (as an interface{}) and returns a []byte. This is particularly useful when
-// you encoding an object upstream and do not wish to re-encode it.
-type NopEncoder struct{}
 
 // MaxLength restricts the maximum length, in bytes, for the cookie value.
 //
@@ -212,35 +94,21 @@ func (s *SecureCookie) MinAge(value int) *SecureCookie {
 	return s
 }
 
-// HashFunc sets the hash function used to create HMAC.
-//
-// Default is crypto/sha256.New.
-func (s *SecureCookie) HashFunc(f func() hash.Hash) *SecureCookie {
-	s.hashFunc = f
-	return s
-}
-
-// BlockFunc sets the encryption function used to create a cipher.Block.
-//
-// Default is crypto/aes.New.
-func (s *SecureCookie) BlockFunc(f func([]byte) (cipher.Block, error)) *SecureCookie {
-	if s.blockKey == nil {
-		s.err = errBlockKeyNotSet
-	} else if block, err := f(s.blockKey); err == nil {
-		s.block = block
-	} else {
-		s.err = cookieError{cause: err, typ: usageError}
-	}
-	return s
-}
-
-// Encoding sets the encoding/serialization method for cookies.
+// SetSerializer sets the encoding/serialization method for cookies.
 //
 // Default is encoding/gob.  To encode special structures using encoding/gob,
 // they must be registered first using gob.Register().
 func (s *SecureCookie) SetSerializer(sz Serializer) *SecureCookie {
 	s.sz = sz
+	return s
+}
 
+// SetTimeFunc sets the function that returns the current timestamp.
+//
+// For testing purposes, the function that generates the timestamp can be
+// overridden. If not set, it will return time.Now().UTC().Unix().
+func (s *SecureCookie) SetTimeFunc(f func() int64) *SecureCookie {
+	s.timeFunc = f
 	return s
 }
 
@@ -256,37 +124,33 @@ func (s *SecureCookie) SetSerializer(sz Serializer) *SecureCookie {
 // It is the client's responsibility to ensure that value, when encoded using
 // the current serialization/encryption settings on s and then base64-encoded,
 // is shorter than the maximum permissible length.
-func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
-	if s.err != nil {
-		return "", s.err
-	}
-	if s.hashKey == nil {
-		s.err = errHashKeyNotSet
-		return "", s.err
-	}
+func (s *SecureCookie) Encode(name string, value any) (string, error) {
 	var err error
 	var b []byte
 	// 1. Serialize.
 	if b, err = s.sz.Serialize(value); err != nil {
-		return "", cookieError{cause: err, typ: usageError}
+		return "", err
 	}
-	// 2. Encrypt (optional).
-	if s.block != nil {
-		if b, err = encrypt(s.block, b); err != nil {
-			return "", cookieError{cause: err, typ: usageError}
-		}
+	// 2. Encrypt.
+	aead, err := chacha20poly1305.NewX(s.key)
+	if err != nil {
+		return "", err
 	}
+	nonce := GenerateRandomKey(aead.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return "", err
+	}
+	// We create a buffer of "name|timestamp|ciphertext" so that we can verify
+	// the validity of the timestamp after decrypting, but before deserializing.
+	buf := new(bytes.Buffer)
+	buf.WriteString(name + "|")
+	buf.WriteString(strconv.FormatInt(s.timestamp(), 10) + "|")
+	buf.Write(b)
+	b = aead.Seal(nonce, nonce, buf.Bytes(), nil)
 	b = encode(b)
-	// 3. Create MAC for "name|date|value". Extra pipe to be used later.
-	b = []byte(fmt.Sprintf("%s|%d|%s|", name, s.timestamp(), b))
-	mac := createMac(hmac.New(s.hashFunc, s.hashKey), b[:len(b)-1])
-	// Append mac, remove name.
-	b = append(b, mac...)[len(name)+1:]
-	// 4. Encode to base64.
-	b = encode(b)
-	// 5. Check length.
+	// 3. Check length.
 	if s.maxLength != 0 && len(b) > s.maxLength {
-		return "", fmt.Errorf("%s: %d", errEncodedValueTooLong, len(b))
+		return "", fmt.Errorf("the value is too long: %d", len(b))
 	}
 	// Done.
 	return string(b), nil
@@ -300,58 +164,50 @@ func (s *SecureCookie) Encode(name string, value interface{}) (string, error) {
 // The name argument is the cookie name. It must be the same name used when
 // it was stored. The value argument is the encoded cookie value. The dst
 // argument is where the cookie will be decoded. It must be a pointer.
-func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
-	if s.err != nil {
-		return s.err
-	}
-	if s.hashKey == nil {
-		s.err = errHashKeyNotSet
-		return s.err
-	}
+func (s *SecureCookie) Decode(name, value string, dst any) error {
 	// 1. Check length.
 	if s.maxLength != 0 && len(value) > s.maxLength {
-		return fmt.Errorf("%s: %d", errValueToDecodeTooLong, len(value))
+		return fmt.Errorf("the value is too long: %d", len(value))
 	}
 	// 2. Decode from base64.
 	b, err := decode([]byte(value))
 	if err != nil {
 		return err
 	}
-	// 3. Verify MAC. Value is "date|value|mac".
-	parts := bytes.SplitN(b, []byte("|"), 3)
-	if len(parts) != 3 {
-		return ErrMacInvalid
-	}
-	h := hmac.New(s.hashFunc, s.hashKey)
-	b = append([]byte(name+"|"), b[:len(b)-len(parts[2])-1]...)
-	if err = verifyMac(h, b, parts[2]); err != nil {
-		return err
-	}
-	// 4. Verify date ranges.
-	var t1 int64
-	if t1, err = strconv.ParseInt(string(parts[0]), 10, 64); err != nil {
-		return errTimestampInvalid
-	}
-	t2 := s.timestamp()
-	if s.minAge != 0 && t1 > t2-s.minAge {
-		return errTimestampTooNew
-	}
-	if s.maxAge != 0 && t1 < t2-s.maxAge {
-		return errTimestampExpired
-	}
-	// 5. Decrypt (optional).
-	b, err = decode(parts[1])
+	// 3. Decrypt.
+	aead, err := chacha20poly1305.NewX(s.key)
 	if err != nil {
 		return err
 	}
-	if s.block != nil {
-		if b, err = decrypt(s.block, b); err != nil {
-			return err
-		}
+	if len(b) < aead.NonceSize() {
+		return ErrDecryptionFailed
 	}
-	// 6. Deserialize.
-	if err = s.sz.Deserialize(b, dst); err != nil {
-		return cookieError{cause: err, typ: decodeError}
+	nonce, ciphertext := b[:aead.NonceSize()], b[aead.NonceSize():]
+	b, err = aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return err
+	}
+	parts := bytes.SplitN(b, []byte("|"), 3)
+	if len(parts) != 3 {
+		return ErrDecryptionFailed
+	}
+	if string(parts[0]) != name {
+		return fmt.Errorf("the name is not valid: %s", name)
+	}
+	ts, err := strconv.ParseInt(string(parts[1]), 10, 64)
+	if err != nil {
+		return fmt.Errorf("the timestamp is not valid: %s", parts[1])
+	}
+	now := s.timestamp()
+	if s.minAge != 0 && ts > now-s.minAge {
+		return fmt.Errorf("timestamp is too new: %d", ts)
+	}
+	if s.maxAge != 0 && ts < now-s.maxAge {
+		return fmt.Errorf("expired timestamp: %d", ts)
+	}
+	// 4. Deserialize.
+	if err = s.sz.Deserialize(parts[2], dst); err != nil {
+		return err
 	}
 	// Done.
 	return nil
@@ -362,124 +218,7 @@ func (s *SecureCookie) Decode(name, value string, dst interface{}) error {
 // For testing purposes, the function that generates the timestamp can be
 // overridden. If not set, it will return time.Now().UTC().Unix().
 func (s *SecureCookie) timestamp() int64 {
-	if s.timeFunc == nil {
-		return time.Now().UTC().Unix()
-	}
 	return s.timeFunc()
-}
-
-// Authentication -------------------------------------------------------------
-
-// createMac creates a message authentication code (MAC).
-func createMac(h hash.Hash, value []byte) []byte {
-	h.Write(value)
-	return h.Sum(nil)
-}
-
-// verifyMac verifies that a message authentication code (MAC) is valid.
-func verifyMac(h hash.Hash, value []byte, mac []byte) error {
-	mac2 := createMac(h, value)
-	// Check that both MACs are of equal length, as subtle.ConstantTimeCompare
-	// does not do this prior to Go 1.4.
-	if len(mac) == len(mac2) && subtle.ConstantTimeCompare(mac, mac2) == 1 {
-		return nil
-	}
-	return ErrMacInvalid
-}
-
-// Encryption -----------------------------------------------------------------
-
-// encrypt encrypts a value using the given block in counter mode.
-//
-// A random initialization vector ( https://en.wikipedia.org/wiki/Block_cipher_mode_of_operation#Initialization_vector_(IV) ) with the length of the
-// block size is prepended to the resulting ciphertext.
-func encrypt(block cipher.Block, value []byte) ([]byte, error) {
-	iv := GenerateRandomKey(block.BlockSize())
-	if iv == nil {
-		return nil, errGeneratingIV
-	}
-	// Encrypt it.
-	stream := cipher.NewCTR(block, iv)
-	stream.XORKeyStream(value, value)
-	// Return iv + ciphertext.
-	return append(iv, value...), nil
-}
-
-// decrypt decrypts a value using the given block in counter mode.
-//
-// The value to be decrypted must be prepended by a initialization vector
-// ( https://en.wikipedia.org/wiki/Block_cipher_mode_of_operation#Initialization_vector_(IV) ) with the length of the block size.
-func decrypt(block cipher.Block, value []byte) ([]byte, error) {
-	size := block.BlockSize()
-	if len(value) > size {
-		// Extract iv.
-		iv := value[:size]
-		// Extract ciphertext.
-		value = value[size:]
-		// Decrypt it.
-		stream := cipher.NewCTR(block, iv)
-		stream.XORKeyStream(value, value)
-		return value, nil
-	}
-	return nil, errDecryptionFailed
-}
-
-// Serialization --------------------------------------------------------------
-
-// Serialize encodes a value using gob.
-func (e GobEncoder) Serialize(src interface{}) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	enc := gob.NewEncoder(buf)
-	if err := enc.Encode(src); err != nil {
-		return nil, cookieError{cause: err, typ: usageError}
-	}
-	return buf.Bytes(), nil
-}
-
-// Deserialize decodes a value using gob.
-func (e GobEncoder) Deserialize(src []byte, dst interface{}) error {
-	dec := gob.NewDecoder(bytes.NewBuffer(src))
-	if err := dec.Decode(dst); err != nil {
-		return cookieError{cause: err, typ: decodeError}
-	}
-	return nil
-}
-
-// Serialize encodes a value using encoding/json.
-func (e JSONEncoder) Serialize(src interface{}) ([]byte, error) {
-	buf := new(bytes.Buffer)
-	enc := json.NewEncoder(buf)
-	if err := enc.Encode(src); err != nil {
-		return nil, cookieError{cause: err, typ: usageError}
-	}
-	return buf.Bytes(), nil
-}
-
-// Deserialize decodes a value using encoding/json.
-func (e JSONEncoder) Deserialize(src []byte, dst interface{}) error {
-	dec := json.NewDecoder(bytes.NewReader(src))
-	if err := dec.Decode(dst); err != nil {
-		return cookieError{cause: err, typ: decodeError}
-	}
-	return nil
-}
-
-// Serialize passes a []byte through as-is.
-func (e NopEncoder) Serialize(src interface{}) ([]byte, error) {
-	if b, ok := src.([]byte); ok {
-		return b, nil
-	}
-
-	return nil, errValueNotByte
-}
-
-// Deserialize passes a []byte through as-is.
-func (e NopEncoder) Deserialize(src []byte, dst interface{}) error {
-	if dat, ok := dst.(*[]byte); ok {
-		*dat = src
-		return nil
-	}
-	return errValueNotBytePtr
 }
 
 // Encoding -------------------------------------------------------------------
@@ -496,7 +235,7 @@ func decode(value []byte) ([]byte, error) {
 	decoded := make([]byte, base64.URLEncoding.DecodedLen(len(value)))
 	b, err := base64.URLEncoding.Decode(decoded, value)
 	if err != nil {
-		return nil, cookieError{cause: err, typ: decodeError, msg: "base64 decode failed"}
+		return nil, err
 	}
 	return decoded[:b], nil
 }
@@ -513,11 +252,11 @@ func decode(value []byte) ([]byte, error) {
 // Callers should explicitly check for the possibility of a nil return, treat
 // it as a failure of the system random number generator, and not continue.
 func GenerateRandomKey(length int) []byte {
-	k := make([]byte, length)
-	if _, err := io.ReadFull(rand.Reader, k); err != nil {
-		return nil
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("securecookie: error generating random key: %v", err))
 	}
-	return k
+	return b
 }
 
 // CodecsFromPairs returns a slice of SecureCookie instances.
@@ -529,11 +268,9 @@ func GenerateRandomKey(length int) []byte {
 //
 // Example:
 //
-//	codecs := securecookie.CodecsFromPairs(
-//	     []byte("new-hash-key"),
-//	     []byte("new-block-key"),
-//	     []byte("old-hash-key"),
-//	     []byte("old-block-key"),
+//	codecs, _ := securecookie.CodecsFromPairs(
+//	     []byte("new-key"),
+//	     []byte("old-key"),
 //	 )
 //
 //	// Modify each instance.
@@ -541,19 +278,18 @@ func GenerateRandomKey(length int) []byte {
 //	       if cookie, ok := s.(*securecookie.SecureCookie); ok {
 //	           cookie.MaxAge(86400 * 7)
 //	           cookie.SetSerializer(securecookie.JSONEncoder{})
-//	           cookie.HashFunc(sha512.New512_256)
 //	       }
 //	   }
-func CodecsFromPairs(keyPairs ...[]byte) []Codec {
-	codecs := make([]Codec, len(keyPairs)/2+len(keyPairs)%2)
-	for i := 0; i < len(keyPairs); i += 2 {
-		var blockKey []byte
-		if i+1 < len(keyPairs) {
-			blockKey = keyPairs[i+1]
+func CodecsFromPairs(keys ...[]byte) ([]Codec, error) {
+	var codecs []Codec
+	for _, v := range keys {
+		codec, err := New(v)
+		if err != nil {
+			return nil, err
 		}
-		codecs[i/2] = New(keyPairs[i], blockKey)
+		codecs = append(codecs, codec)
 	}
-	return codecs
+	return codecs, nil
 }
 
 // EncodeMulti encodes a cookie value using a group of codecs.
@@ -562,9 +298,9 @@ func CodecsFromPairs(keyPairs ...[]byte) []Codec {
 // key rotation.
 //
 // On error, may return a MultiError.
-func EncodeMulti(name string, value interface{}, codecs ...Codec) (string, error) {
+func EncodeMulti(name string, value any, codecs ...Codec) (string, error) {
 	if len(codecs) == 0 {
-		return "", errNoCodecs
+		return "", ErrNoCodecs
 	}
 
 	var errors MultiError
@@ -584,9 +320,9 @@ func EncodeMulti(name string, value interface{}, codecs ...Codec) (string, error
 // key rotation.
 //
 // On error, may return a MultiError.
-func DecodeMulti(name string, value string, dst interface{}, codecs ...Codec) error {
+func DecodeMulti(name string, value string, dst any, codecs ...Codec) error {
 	if len(codecs) == 0 {
-		return errNoCodecs
+		return ErrNoCodecs
 	}
 
 	var errors MultiError
@@ -602,20 +338,6 @@ func DecodeMulti(name string, value string, dst interface{}, codecs ...Codec) er
 
 // MultiError groups multiple errors.
 type MultiError []error
-
-func (m MultiError) IsUsage() bool    { return m.any(func(e Error) bool { return e.IsUsage() }) }
-func (m MultiError) IsDecode() bool   { return m.any(func(e Error) bool { return e.IsDecode() }) }
-func (m MultiError) IsInternal() bool { return m.any(func(e Error) bool { return e.IsInternal() }) }
-
-// Cause returns nil for MultiError; there is no unique underlying cause in the
-// general case.
-//
-// Note: we could conceivably return a non-nil Cause only when there is exactly
-// one child error with a Cause.  However, it would be brittle for client code
-// to rely on the arity of causes inside a MultiError, so we have opted not to
-// provide this functionality.  Clients which really wish to access the Causes
-// of the underlying errors are free to iterate through the errors themselves.
-func (m MultiError) Cause() error { return nil }
 
 func (m MultiError) Error() string {
 	s, n := "", 0
@@ -636,14 +358,4 @@ func (m MultiError) Error() string {
 		return s + " (and 1 other error)"
 	}
 	return fmt.Sprintf("%s (and %d other errors)", s, n-1)
-}
-
-// any returns true if any element of m is an Error for which pred returns true.
-func (m MultiError) any(pred func(Error) bool) bool {
-	for _, e := range m {
-		if ourErr, ok := e.(Error); ok && pred(ourErr) {
-			return true
-		}
-	}
-	return false
 }

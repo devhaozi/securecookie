@@ -10,8 +10,8 @@
 securecookie encodes and decodes authenticated and optionally encrypted
 cookie values.
 
-Secure cookies can't be forged, because their values are validated using HMAC.
-When encrypted, the content is also inaccessible to malicious eyes. It is still
+Secure cookies can't be forged, because their values are encrypted and validated
+using ChaCha20-Poly1305, the content is inaccessible to malicious eyes. It is still
 recommended that sensitive data not be stored in cookies, and that HTTPS be used
 to prevent cookie [replay attacks](https://en.wikipedia.org/wiki/Replay_attack).
 
@@ -20,21 +20,13 @@ to prevent cookie [replay attacks](https://en.wikipedia.org/wiki/Replay_attack).
 To use it, first create a new SecureCookie instance:
 
 ```go
-// Hash keys should be at least 32 bytes long
-var hashKey = []byte("very-secret")
-// Block keys should be 16 bytes (AES-128) or 32 bytes (AES-256) long.
-// Shorter keys may weaken the encryption used.
-var blockKey = []byte("a-lot-secret")
-var s = securecookie.New(hashKey, blockKey)
+// Keys must be 32 bytes long
+var key = []byte("32-byte-long-auth-key")
+var s, err = securecookie.New(hashKey, blockKey)
 ```
 
-The hashKey is required, used to authenticate the cookie value using HMAC.
-It is recommended to use a key with 32 or 64 bytes.
-
-The blockKey is optional, used to encrypt the cookie value -- set it to nil
-to not use encryption. If set, the length must correspond to the block size
-of the encryption algorithm. For AES, used by default, valid lengths are
-16, 24, or 32 bytes to select AES-128, AES-192, or AES-256.
+The key is required and must be 32 bytes, used to authenticate and
+encrypt cookie values.
 
 Strong keys can be created using the convenience function
 `GenerateRandomKey()`. Note that keys created using `GenerateRandomKey()` are not
@@ -75,11 +67,8 @@ func ReadCookieHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-We stored a map[string]string, but secure cookies can hold any value that
-can be encoded using `encoding/gob`. To store custom types, they must be
-registered first using gob.Register(). For basic types this is not needed;
-it works out of the box. An optional JSON encoder that uses `encoding/json` is
-available for types compatible with JSON.
+Secure cookies can hold any value thatcan be encoded using encoding/json.
+it works out of the box.
 
 ### Key Rotation
 Rotating keys is an important part of any security strategy. The `EncodeMulti` and
@@ -89,15 +78,11 @@ For example, let's take a system that stores keys in a map:
 ```go
 // keys stored in a map will not be persisted between restarts
 // a more persistent storage should be considered for production applications.
+var previous, _ = securecookie.New(securecookie.GenerateRandomKey(32))
+var current, _ = securecookie.New(securecookie.GenerateRandomKey(32))
 var cookies = map[string]*securecookie.SecureCookie{
-	"previous": securecookie.New(
-		securecookie.GenerateRandomKey(64),
-		securecookie.GenerateRandomKey(32),
-	),
-	"current": securecookie.New(
-		securecookie.GenerateRandomKey(64),
-		securecookie.GenerateRandomKey(32),
-	),
+	"previous": previous,
+	"current": current,
 }
 ```
 

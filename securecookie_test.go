@@ -5,10 +5,8 @@
 package securecookie
 
 import (
-	"crypto/aes"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -17,11 +15,7 @@ import (
 	fuzz "github.com/google/gofuzz"
 )
 
-// Asserts that cookieError and MultiError are Error implementations.
-var _ Error = cookieError{}
-var _ Error = MultiError{}
-
-var testCookies = []interface{}{
+var testCookies = []any{
 	map[string]string{"foo": "bar"},
 	map[string]string{"baz": "ding"},
 }
@@ -30,61 +24,48 @@ var testStrings = []string{"foo", "bar", "baz"}
 
 func TestSecureCookie(t *testing.T) {
 	// TODO test too old / too new timestamps
-	s1 := New([]byte("12345"), []byte("1234567890123456"))
-	s2 := New([]byte("54321"), []byte("6543210987654321"))
-	value := map[string]interface{}{
+	s1, err1 := New([]byte("12345678901234567890123456789012"))
+	s2, err2 := New([]byte("abcdefghijklmnopqrstuvwxyz123456"))
+	if err1 != nil {
+		t.Fatal(err1)
+	}
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	value := map[string]any{
 		"foo": "bar",
-		"baz": 128,
+		"baz": float64(128),
 	}
 
 	for i := 0; i < 50; i++ {
 		// Running this multiple times to check if any special character
 		// breaks encoding/decoding.
-		encoded, err1 := s1.Encode("sid", value)
-		if err1 != nil {
-			t.Error(err1)
+		encoded, err := s1.Encode("sid", value)
+		if err != nil {
+			t.Error(err)
 			continue
 		}
-		dst := make(map[string]interface{})
-		err2 := s1.Decode("sid", encoded, &dst)
-		if err2 != nil {
-			t.Fatalf("%v: %v", err2, encoded)
+		dst := make(map[string]any)
+		if err = s1.Decode("sid", encoded, &dst); err != nil {
+			t.Fatalf("%#v: %#v", err, encoded)
 		}
 		if !reflect.DeepEqual(dst, value) {
-			t.Fatalf("Expected %v, got %v.", value, dst)
+			t.Fatalf("Expected %#v, got %#v.", value, dst)
 		}
-		dst2 := make(map[string]interface{})
-		err3 := s2.Decode("sid", encoded, &dst2)
-		if err3 == nil {
+		dst2 := make(map[string]any)
+		if err = s2.Decode("sid", encoded, &dst2); err == nil {
 			t.Fatalf("Expected failure decoding.")
-		}
-		err4, ok := err3.(Error)
-		if !ok {
-			t.Fatalf("Expected error to implement Error, got: %#v", err3)
-		}
-		if !err4.IsDecode() {
-			t.Fatalf("Expected DecodeError, got: %#v", err4)
-		}
-
-		// Test other error type flags.
-		if err4.IsUsage() {
-			t.Fatalf("Expected IsUsage() == false, got: %#v", err4)
-		}
-		if err4.IsInternal() {
-			t.Fatalf("Expected IsInternal() == false, got: %#v", err4)
 		}
 	}
 }
 
 func TestSecureCookieNilKey(t *testing.T) {
-	s1 := New(nil, nil)
-	value := map[string]interface{}{
-		"foo": "bar",
-		"baz": 128,
+	s1, err := New(nil)
+	if s1 != nil {
+		t.Fatalf("Expected nil, got %#v", s1)
 	}
-	_, err := s1.Encode("sid", value)
-	if err != errHashKeyNotSet {
-		t.Fatal("Wrong error returned:", err)
+	if !errors.Is(err, ErrKeyLength) {
+		t.Fatalf("Expected ErrKeyLength, got %#v", err)
 	}
 }
 
@@ -99,7 +80,10 @@ func TestDecodeInvalid(t *testing.T) {
 		"|||",
 		"cookie",
 	}
-	s := New([]byte("12345"), nil)
+	s, err := New([]byte("12345678901234567890123456789012"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	var dst string
 	for i, v := range invalidCookies {
 		for _, enc := range []*base64.Encoding{
@@ -109,43 +93,6 @@ func TestDecodeInvalid(t *testing.T) {
 			err := s.Decode("name", enc.EncodeToString([]byte(v)), &dst)
 			if err == nil {
 				t.Fatalf("%d: expected failure decoding", i)
-			}
-			err2, ok := err.(Error)
-			if !ok || !err2.IsDecode() {
-				t.Fatalf("%d: Expected IsDecode(), got: %#v", i, err)
-			}
-		}
-	}
-}
-
-func TestAuthentication(t *testing.T) {
-	hash := hmac.New(sha256.New, []byte("secret-key"))
-	for _, value := range testStrings {
-		hash.Reset()
-		signed := createMac(hash, []byte(value))
-		hash.Reset()
-		err := verifyMac(hash, []byte(value), signed)
-		if err != nil {
-			t.Error(err)
-		}
-	}
-}
-
-func TestEncryption(t *testing.T) {
-	block, err := aes.NewCipher([]byte("1234567890123456"))
-	if err != nil {
-		t.Fatalf("Block could not be created")
-	}
-	var encrypted, decrypted []byte
-	for _, value := range testStrings {
-		if encrypted, err = encrypt(block, []byte(value)); err != nil {
-			t.Error(err)
-		} else {
-			if decrypted, err = decrypt(block, encrypted); err != nil {
-				t.Error(err)
-			}
-			if string(decrypted) != value {
-				t.Errorf("Expected %v, got %v.", value, string(decrypted))
 			}
 		}
 	}
@@ -166,8 +113,8 @@ func TestGobSerialization(t *testing.T) {
 			if err = sz.Deserialize(serialized, &deserialized); err != nil {
 				t.Error(err)
 			}
-			if fmt.Sprintf("%v", deserialized) != fmt.Sprintf("%v", value) {
-				t.Errorf("Expected %v, got %v.", value, deserialized)
+			if fmt.Sprintf("%#v", deserialized) != fmt.Sprintf("%#v", value) {
+				t.Errorf("Expected %#v, got %#v.", value, deserialized)
 			}
 		}
 	}
@@ -188,8 +135,8 @@ func TestJSONSerialization(t *testing.T) {
 			if err = sz.Deserialize(serialized, &deserialized); err != nil {
 				t.Error(err)
 			}
-			if fmt.Sprintf("%v", deserialized) != fmt.Sprintf("%v", value) {
-				t.Errorf("Expected %v, got %v.", value, deserialized)
+			if fmt.Sprintf("%#v", deserialized) != fmt.Sprintf("%#v", value) {
+				t.Errorf("Expected %#v, got %#v.", value, deserialized)
 			}
 		}
 	}
@@ -199,8 +146,8 @@ func TestNopSerialization(t *testing.T) {
 	cookieData := "fooobar123"
 	sz := NopEncoder{}
 
-	if _, err := sz.Serialize(cookieData); err != errValueNotByte {
-		t.Fatal("Expected error passing string")
+	if _, err := sz.Serialize(cookieData); !errors.Is(err, ErrValueNotByte) {
+		t.Fatal("Expected error unless you pass a []byte")
 	}
 	dat, err := sz.Serialize([]byte(cookieData))
 	if err != nil {
@@ -211,7 +158,7 @@ func TestNopSerialization(t *testing.T) {
 	}
 
 	var dst []byte
-	if err = sz.Deserialize(dat, dst); err != errValueNotBytePtr {
+	if err = sz.Deserialize(dat, dst); !errors.Is(err, ErrValueNotBytePtr) {
 		t.Fatal("Expect error unless you pass a *[]byte")
 	}
 	if err = sz.Deserialize(dat, &dst); err != nil {
@@ -229,43 +176,43 @@ func TestEncoding(t *testing.T) {
 		if err != nil {
 			t.Error(err)
 		} else if string(decoded) != value {
-			t.Errorf("Expected %v, got %s.", value, string(decoded))
+			t.Errorf("Expected %#v, got %s.", value, string(decoded))
 		}
 	}
 }
 
 func TestMultiError(t *testing.T) {
-	s1, s2 := New(nil, nil), New(nil, nil)
-	_, err := EncodeMulti("sid", "value", s1, s2)
+	s1, err1 := New([]byte("12345678901234567890123456789012"))
+	s2, err2 := New([]byte("abcdefghijklmnopqrstuvwxyz123456"))
+	if err1 != nil {
+		t.Fatal(err1)
+	}
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	_, err := EncodeMulti("sid", New, s1, s2)
+	if err == nil {
+		t.Fatal("Expected failure encoding.")
+	}
 	if len(err.(MultiError)) != 2 {
 		t.Errorf("Expected 2 errors, got %s.", err)
 	} else {
-		if !strings.Contains(err.Error(), "hash key is not set") {
-			t.Errorf("Expected missing hash key error, got %s.", err.Error())
-		}
-		ourErr, ok := err.(Error)
-		if !ok || !ourErr.IsUsage() {
-			t.Fatalf("Expected error to be a usage error; got %#v", err)
-		}
-		if ourErr.IsDecode() {
-			t.Errorf("Expected error NOT to be a decode error; got %#v", ourErr)
-		}
-		if ourErr.IsInternal() {
-			t.Errorf("Expected error NOT to be an internal error; got %#v", ourErr)
+		if !strings.Contains(err.Error(), "unsupported type") {
+			t.Errorf("Expected unsupported type error, got %s.", err.Error())
 		}
 	}
 }
 
 func TestMultiNoCodecs(t *testing.T) {
 	_, err := EncodeMulti("foo", "bar")
-	if err != errNoCodecs {
-		t.Errorf("EncodeMulti: bad value for error, got: %v", err)
+	if !errors.Is(err, ErrNoCodecs) {
+		t.Errorf("EncodeMulti: bad value for error, got: %#v", err)
 	}
 
 	var dst []byte
 	err = DecodeMulti("foo", "bar", &dst)
-	if err != errNoCodecs {
-		t.Errorf("DecodeMulti: bad value for error, got: %v", err)
+	if !errors.Is(err, ErrNoCodecs) {
+		t.Errorf("DecodeMulti: bad value for error, got: %#v", err)
 	}
 }
 
@@ -276,15 +223,12 @@ func TestMissingKey(t *testing.T) {
 	}
 
 	for _, key := range emptyKeys {
-		s1 := New(key, nil)
-
-		var dst []byte
-		err := s1.Decode("sid", "value", &dst)
-		if err != errHashKeyNotSet {
-			t.Fatalf("Expected %#v, got %#v", errHashKeyNotSet, err)
+		s1, err := New(key)
+		if s1 != nil {
+			t.Fatalf("Expected nil, got %#v", s1)
 		}
-		if err2, ok := err.(Error); !ok || !err2.IsUsage() {
-			t.Errorf("Expected missing hash key to be IsUsage(); was %#v", err)
+		if !errors.Is(err, ErrKeyLength) {
+			t.Fatalf("Expected ErrKeyLength, got %#v", err)
 		}
 	}
 }
@@ -297,7 +241,10 @@ type FooBar struct {
 }
 
 func TestCustomType(t *testing.T) {
-	s1 := New([]byte("12345"), []byte("1234567890123456"))
+	s1, err := New([]byte("12345678901234567890123456789012"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Type is not registered in gob. (!!!)
 	src := &FooBar{42, "bar"}
 	encoded, _ := s1.Encode("sid", src)
@@ -317,7 +264,10 @@ type Cookie struct {
 
 func FuzzEncodeDecode(f *testing.F) {
 	fuzzer := fuzz.New()
-	s1 := New([]byte("12345"), []byte("1234567890123456"))
+	s1, err := New([]byte("12345678901234567890123456789012"))
+	if err != nil {
+		f.Fatal(err)
+	}
 	s1.maxLength = 0
 
 	for i := 0; i < 100000; i++ {
@@ -330,15 +280,15 @@ func FuzzEncodeDecode(f *testing.F) {
 		c := Cookie{b, i, s}
 		encoded, err := s1.Encode("sid", c)
 		if err != nil {
-			t.Errorf("Encode failed: %v", err)
+			t.Errorf("Encode failed: %#v", err)
 		}
 		dc := Cookie{}
 		err = s1.Decode("sid", encoded, &dc)
 		if err != nil {
-			t.Errorf("Decode failed: %v", err)
+			t.Errorf("Decode failed: %#v", err)
 		}
 		if dc != c {
-			t.Fatalf("Expected %v, got %v.", s, dc)
+			t.Fatalf("Expected %#v, got %#v.", s, dc)
 		}
 	})
 }
