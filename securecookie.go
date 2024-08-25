@@ -127,7 +127,9 @@ func (s *SecureCookie) Encode(name string, value any) (string, error) {
 	key := s.key
 	index := -1
 walk:
-	b, err = s.encrypt([]byte(name), key, b)
+	// We can't directly use 'b' here because if the encryption fails, we need
+	// to retry with a different key.
+	enc, err := s.encrypt([]byte(name), key, b)
 	if err != nil {
 		errors = append(errors, err)
 		if index++; index < len(s.rotatedKeys) {
@@ -137,7 +139,7 @@ walk:
 			return "", errors
 		}
 	}
-	b = encode(b)
+	b = encode(enc)
 	// 3. Check length.
 	if s.maxLength != 0 && len(b) > s.maxLength {
 		return "", fmt.Errorf("the value is too long: %d", len(b))
@@ -170,7 +172,9 @@ func (s *SecureCookie) Decode(name, value string, dst any) error {
 	key := s.key
 	index := -1
 walk:
-	b, err = s.decrypt([]byte(name), key, b)
+	// We can't directly use 'b' here because if the decryption fails, we need
+	// to retry with a different key.
+	dec, err := s.decrypt([]byte(name), key, b)
 	if err != nil {
 		errors = append(errors, err)
 		if index++; index < len(s.rotatedKeys) {
@@ -180,7 +184,7 @@ walk:
 			return errors
 		}
 	}
-	parts := bytes.SplitN(b, []byte("|"), 2)
+	parts := bytes.SplitN(dec, []byte("|"), 2)
 	if len(parts) != 2 {
 		return ErrDecryptionFailed
 	}

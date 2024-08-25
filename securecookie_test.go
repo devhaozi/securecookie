@@ -294,22 +294,38 @@ func FuzzEncodeDecode(f *testing.F) {
 }
 
 func TestEncodeDecodeWithRotatedKeys(t *testing.T) {
-	rotatedKey := []byte("abcdefghijklmnopqrstuvwxyz123456")
-	s1, err := New([]byte("12345678901234567890123456789012"), &Options{RotatedKeys: [][]byte{rotatedKey}})
+	key1 := []byte("abcdefghijklmnopqrstuvwxyz123456")
+	key2 := []byte("12345678901234567890123456789012")
+	s1, err := New(key1, &Options{RotatedKeys: [][]byte{key2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := New(key2, &Options{RotatedKeys: [][]byte{key1}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	value := map[string]any{"foo": "bar"}
-	encoded, err := s1.Encode("sid", value)
+	encoded1, err := s1.Encode("sid", value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dst := make(map[string]any)
-	if err = s1.Decode("sid", encoded, &dst); err != nil {
+	encoded2, err := s2.Encode("sid", value)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(dst, value) {
-		t.Fatalf("Expected %#v, got %#v.", value, dst)
+	dst1 := make(map[string]any)
+	if err = s2.Decode("sid", encoded1, &dst1); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(dst1, value) {
+		t.Fatalf("Expected %#v, got %#v.", value, dst1)
+	}
+	dst2 := make(map[string]any)
+	if err = s1.Decode("sid", encoded2, &dst2); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(dst2, value) {
+		t.Fatalf("Expected %#v, got %#v.", value, dst2)
 	}
 }
 
