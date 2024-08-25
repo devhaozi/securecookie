@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	fuzz "github.com/google/gofuzz"
 )
@@ -23,9 +24,8 @@ var testCookies = []any{
 var testStrings = []string{"foo", "bar", "baz"}
 
 func TestSecureCookie(t *testing.T) {
-	// TODO test too old / too new timestamps
-	s1, err1 := New([]byte("12345678901234567890123456789012"))
-	s2, err2 := New([]byte("abcdefghijklmnopqrstuvwxyz123456"))
+	s1, err1 := New([]byte("12345678901234567890123456789012"), DefaultOptions)
+	s2, err2 := New([]byte("abcdefghijklmnopqrstuvwxyz123456"), DefaultOptions)
 	if err1 != nil {
 		t.Fatal(err1)
 	}
@@ -60,7 +60,7 @@ func TestSecureCookie(t *testing.T) {
 }
 
 func TestSecureCookieNilKey(t *testing.T) {
-	s1, err := New(nil)
+	s1, err := New(nil, DefaultOptions)
 	if s1 != nil {
 		t.Fatalf("Expected nil, got %#v", s1)
 	}
@@ -80,7 +80,7 @@ func TestDecodeInvalid(t *testing.T) {
 		"|||",
 		"cookie",
 	}
-	s, err := New([]byte("12345678901234567890123456789012"))
+	s, err := New([]byte("12345678901234567890123456789012"), DefaultOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,8 +182,8 @@ func TestEncoding(t *testing.T) {
 }
 
 func TestMultiError(t *testing.T) {
-	s1, err1 := New([]byte("12345678901234567890123456789012"))
-	s2, err2 := New([]byte("abcdefghijklmnopqrstuvwxyz123456"))
+	s1, err1 := New([]byte("12345678901234567890123456789012"), DefaultOptions)
+	s2, err2 := New([]byte("abcdefghijklmnopqrstuvwxyz123456"), DefaultOptions)
 	if err1 != nil {
 		t.Fatal(err1)
 	}
@@ -223,7 +223,7 @@ func TestMissingKey(t *testing.T) {
 	}
 
 	for _, key := range emptyKeys {
-		s1, err := New(key)
+		s1, err := New(key, DefaultOptions)
 		if s1 != nil {
 			t.Fatalf("Expected nil, got %#v", s1)
 		}
@@ -241,7 +241,7 @@ type FooBar struct {
 }
 
 func TestCustomType(t *testing.T) {
-	s1, err := New([]byte("12345678901234567890123456789012"))
+	s1, err := New([]byte("12345678901234567890123456789012"), DefaultOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ type Cookie struct {
 
 func FuzzEncodeDecode(f *testing.F) {
 	fuzzer := fuzz.New()
-	s1, err := New([]byte("12345678901234567890123456789012"))
+	s1, err := New([]byte("12345678901234567890123456789012"), DefaultOptions)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -291,4 +291,76 @@ func FuzzEncodeDecode(f *testing.F) {
 			t.Fatalf("Expected %#v, got %#v.", s, dc)
 		}
 	})
+}
+
+func TestEncodeDecodeWithRotatedKeys(t *testing.T) {
+	rotatedKey := []byte("abcdefghijklmnopqrstuvwxyz123456")
+	s1, err := New([]byte("12345678901234567890123456789012"), &Options{RotatedKeys: [][]byte{rotatedKey}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := map[string]any{"foo": "bar"}
+	encoded, err := s1.Encode("sid", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make(map[string]any)
+	if err = s1.Decode("sid", encoded, &dst); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(dst, value) {
+		t.Fatalf("Expected %#v, got %#v.", value, dst)
+	}
+}
+
+func TestEncodeDecodeWithExpiredTimestamp(t *testing.T) {
+	s1, err := New([]byte("12345678901234567890123456789012"), &Options{MaxAge: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := map[string]any{"foo": "bar"}
+	encoded, err := s1.Encode("sid", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	dst := make(map[string]any)
+	if err = s1.Decode("sid", encoded, &dst); err == nil {
+		t.Fatal("Expected failure due to expired timestamp.")
+	}
+}
+
+func TestEncodeDecodeWithFutureTimestamp(t *testing.T) {
+	s1, err := New([]byte("12345678901234567890123456789012"), &Options{MinAge: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := map[string]any{"foo": "bar"}
+	encoded, err := s1.Encode("sid", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make(map[string]any)
+	if err = s1.Decode("sid", encoded, &dst); err == nil {
+		t.Fatal("Expected failure due to future timestamp.")
+	}
+}
+
+func TestEncodeDecodeWithInvalidKeyLength(t *testing.T) {
+	_, err := New([]byte("shortkey"), DefaultOptions)
+	if !errors.Is(err, ErrKeyLength) {
+		t.Fatalf("Expected ErrKeyLength, got %#v", err)
+	}
+}
+
+func TestEncodeDecodeWithMaxLengthExceeded(t *testing.T) {
+	s1, err := New([]byte("12345678901234567890123456789012"), &Options{MaxLength: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := map[string]any{"foo": "bar"}
+	_, err = s1.Encode("sid", value)
+	if err == nil {
+		t.Fatal("Expected failure due to max length exceeded.")
+	}
 }
