@@ -344,6 +344,9 @@ func TestEncodeDecodeWithExpiredTimestamp(t *testing.T) {
 	if err = s1.Decode("sid", encoded, &dst); err == nil {
 		t.Fatal("Expected failure due to expired timestamp.")
 	}
+	if !errors.Is(err, ErrTimestampExpired) {
+		t.Fatalf("Expected ErrTimestampExpired, got %#v", err)
+	}
 }
 
 func TestEncodeDecodeWithFutureTimestamp(t *testing.T) {
@@ -359,6 +362,9 @@ func TestEncodeDecodeWithFutureTimestamp(t *testing.T) {
 	dst := make(map[string]any)
 	if err = s1.Decode("sid", encoded, &dst); err == nil {
 		t.Fatal("Expected failure due to future timestamp.")
+	}
+	if !errors.Is(err, ErrTimestampTooNew) {
+		t.Fatalf("Expected ErrTimestampTooNew, got %#v", err)
 	}
 }
 
@@ -378,5 +384,8 @@ func TestEncodeDecodeWithMaxLengthExceeded(t *testing.T) {
 	_, err = s1.Encode("sid", value)
 	if err == nil {
 		t.Fatal("Expected failure due to max length exceeded.")
+	}
+	if !errors.Is(err, ErrValueTooLong) {
+		t.Fatalf("Expected ErrValueTooLong, got %#v", err)
 	}
 }

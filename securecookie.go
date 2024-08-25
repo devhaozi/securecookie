@@ -21,6 +21,10 @@ var (
 	ErrNoCodecs         = fmt.Errorf("no codecs provided")
 	ErrValueNotByte     = fmt.Errorf("the value is not a []byte")
 	ErrValueNotBytePtr  = fmt.Errorf("the value is not a *[]byte")
+	ErrValueTooLong     = fmt.Errorf("the value is too long")
+	ErrTimestampInvalid = fmt.Errorf("the timestamp is invalid")
+	ErrTimestampTooNew  = fmt.Errorf("the timestamp is too new")
+	ErrTimestampExpired = fmt.Errorf("the timestamp is expired")
 )
 
 var DefaultOptions = &Options{
@@ -142,7 +146,7 @@ walk:
 	b = encode(enc)
 	// 3. Check length.
 	if s.maxLength != 0 && len(b) > s.maxLength {
-		return "", fmt.Errorf("the value is too long: %d", len(b))
+		return "", ErrValueTooLong
 	}
 	// Done.
 	return string(b), nil
@@ -161,7 +165,7 @@ func (s *SecureCookie) Decode(name, value string, dst any) error {
 	var errors MultiError
 	// 1. Check length.
 	if s.maxLength != 0 && len(value) > s.maxLength {
-		return fmt.Errorf("the value is too long: %d", len(value))
+		return ErrValueTooLong
 	}
 	// 2. Decode from base64.
 	b, err := decode([]byte(value))
@@ -190,14 +194,14 @@ walk:
 	}
 	ts, err := strconv.ParseInt(string(parts[0]), 10, 64)
 	if err != nil {
-		return fmt.Errorf("the timestamp is not valid: %s", parts[1])
+		return ErrTimestampInvalid
 	}
 	now := s.timestamp()
 	if s.minAge != 0 && ts > now-s.minAge {
-		return fmt.Errorf("timestamp is too new: %d", ts)
+		return ErrTimestampTooNew
 	}
 	if s.maxAge != 0 && ts < now-s.maxAge {
-		return fmt.Errorf("expired timestamp: %d", ts)
+		return ErrTimestampExpired
 	}
 	// 4. Deserialize.
 	if err = s.sz.Deserialize(parts[1], dst); err != nil {
